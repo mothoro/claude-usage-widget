@@ -70,6 +70,14 @@ function parseRows(u) {
     })
 }
 
+// Per-product share of weekly usage (seven_day_breakdown.rows), API order, zero rows dropped.
+function parseMix(u) {
+  const rows = u.seven_day_breakdown && u.seven_day_breakdown.rows
+  if (!Array.isArray(rows)) return []
+  return rows.filter(r => Number(r.percent) > 0)
+    .map(r => ({ name: r.display_name || label({ kind: r.key }), pct: Number(r.percent) }))
+}
+
 // ---- cache ----
 
 function readCache() {
@@ -95,7 +103,7 @@ async function load() {
   if (r.status === 200 && r.json) {
     const rows = parseRows(r.json)
     if (rows.length) {
-      const fresh = { rows, ts: Date.now() }
+      const fresh = { rows, mix: parseMix(r.json), ts: Date.now() }
       fm.writeString(CACHE, JSON.stringify(fresh))
       return fresh
     }
@@ -146,11 +154,12 @@ function render(state, family) {
 
   const small = family !== "medium" && family !== "large"
   const rows = small ? state.rows.slice(0, 2) : state.rows
+  const mix = small ? [] : state.mix || []
   const barW = small ? 126 : 300
   w.setPadding(14, 16, 14, 16)
   w.addSpacer()
   rows.forEach((r, i) => {
-    if (i) w.addSpacer(small ? 12 : 7)
+    if (i) w.addSpacer(small ? 12 : mix.length ? 5 : 7)
     const top = w.addStack()
     top.centerAlignContent()
     const l = top.addText(r.label)
@@ -181,6 +190,45 @@ function render(state, family) {
     }
     bar.addSpacer()
   })
+
+  // Medium only: one stacked bar of per-product share, legend beneath (3 entries per line).
+  if (mix.length) {
+    const tints = [["#007AFF", "#0A84FF"], ["#AF52DE", "#BF5AF2"], ["#FF9500", "#FF9F0A"],
+                   ["#34C759", "#30D158"], ["#5AC8FA", "#64D2FF"], ["#FF2D55", "#FF375F"]]
+    const tint = i => dyn(...tints[i % tints.length])
+    const total = Math.max(100, mix.reduce((s, m) => s + m.pct, 0))
+    w.addSpacer(10)
+    const bar = w.addStack()
+    bar.size = new Size(barW, 6)
+    bar.cornerRadius = 3
+    bar.backgroundColor = track
+    mix.forEach((m, i) => {
+      const seg = bar.addStack()
+      seg.size = new Size(m.pct / total * barW, 6)
+      seg.backgroundColor = tint(i)
+    })
+    bar.addSpacer()
+    for (let i = 0; i < mix.length; i += 3) {
+      w.addSpacer(4)
+      const lg = w.addStack()
+      lg.centerAlignContent()
+      mix.slice(i, i + 3).forEach((m, j) => {
+        if (j) lg.addSpacer(10)
+        const dot = lg.addText("●")
+        dot.font = Font.systemFont(7)
+        dot.textColor = tint(i + j)
+        lg.addSpacer(3)
+        const n = lg.addText(m.name)
+        n.font = Font.systemFont(10)
+        n.textColor = dim
+        n.lineLimit = 1
+        lg.addSpacer(3)
+        const p = lg.addText(`${Math.round(m.pct)}%`)
+        p.font = Font.regularMonospacedSystemFont(10)
+        p.textColor = dim
+      })
+    }
+  }
   w.addSpacer()
   return w
 }
