@@ -57,12 +57,12 @@ function label(l) {
 function parseRows(u) {
   if (Array.isArray(u.limits) && u.limits.length) {
     return u.limits.map(l => ({ label: label(l), pct: Number(l.percent) || 0, resets: l.resets_at || null,
-                                kind: l.kind || "", active: l.is_active !== false, warn: l.severity === "warning" }))
+                                kind: l.kind || "", active: l.is_active !== false }))
   }
   return [["Session", "five_hour", u.five_hour], ["Week", "weekly_all", u.seven_day]]
     .filter(([, , b]) => b && b.utilization != null)
     .map(([lbl, kind, b]) => ({ label: lbl, pct: Number(b.utilization) || 0, resets: b.resets_at || null,
-                                kind, active: true, warn: false }))
+                                kind, active: true }))
 }
 
 // Extra usage row, only when the plan has it switched on. No reset.
@@ -128,10 +128,8 @@ const SHORT = { "Claude Code": "Code", "Claude Duet": "Duet" }
 const SHADES = [1, 0.7, 0.45, 0.25, 0.15]
 const MONO_W = 0.6 // monospaced glyph width per point of font size, for legend fitting
 const ACCENT = ["#D97757", "#D97757"] // [light, dark]
-const ORANGE = ["#FF9500", "#FF9F0A"]
 const RED = ["#FF3B30", "#FF453A"]
-// `hot` is the pre-redesign cache flag (warning or >= 90).
-const toneOf = r => (r.pct >= 90 ? RED : r.warn || r.hot ? ORANGE : ACCENT)
+const toneOf = r => (r.pct >= 90 ? RED : ACCENT)
 const minute = r => (r && r.resets ? Math.floor(new Date(r.resets) / 60e3) : null)
 
 // Hero: an active session limit if there is one, else the all-models weekly limit.
@@ -140,13 +138,13 @@ function pickHero(rows) {
     || rows.find(r => r.kind === "weekly_all") || rows[0]
 }
 
-// Ring gauge image, 7pt stroke with round caps. DrawContext colors are static, so it uses the light tint.
-function ring(pct, d, tone, a) {
+// Ring gauge image with round caps. DrawContext colors are static, so it uses the light tint.
+function ring(pct, d, sw, tone, a) {
   const ctx = new DrawContext()
   ctx.size = new Size(d, d)
   ctx.opaque = false
   ctx.respectScreenScale = true
-  const sw = 7, r = (d - sw) / 2, c = d / 2
+  const r = (d - sw) / 2, c = d / 2
   ctx.setLineWidth(sw)
   ctx.setStrokeColor(new Color(tone[0], 0.18 * a))
   ctx.strokeEllipse(new Rect(sw / 2, sw / 2, d - sw, d - sw))
@@ -211,17 +209,17 @@ function render(state, family) {
     return z === "now" ? "Resets now" : z ? `Resets in ${z}` : ""
   }
   // Ring with the percent centered on it.
-  const gauge = (parent, d) => {
+  const gauge = (parent, d, sw, size) => {
     const g = parent.addStack()
     g.size = new Size(d, d)
-    g.backgroundImage = ring(hero.pct, d, toneOf(hero), a)
+    g.backgroundImage = ring(hero.pct, d, sw, toneOf(hero), a)
     g.centerAlignContent()
     g.addSpacer()
     const n = g.addStack()
     n.bottomAlignContent()
-    text(n, `${Math.round(hero.pct)}`, Font.boldMonospacedSystemFont(22), fg)
+    text(n, `${Math.round(hero.pct)}`, Font.boldMonospacedSystemFont(size), fg)
     n.addSpacer(1)
-    text(n, "%", Font.systemFont(11), dim)
+    text(n, "%", Font.systemFont(Math.round(size / 2)), dim)
     g.addSpacer()
   }
 
@@ -234,7 +232,7 @@ function render(state, family) {
       s.addSpacer()
     }
     w.addSpacer()
-    centered(s => gauge(s, 76))
+    centered(s => gauge(s, 76, 7, 22))
     w.addSpacer(6)
     centered(s => text(s, hero.label, Font.systemFont(15), fg))
     const rz = heroReset()
@@ -246,36 +244,43 @@ function render(state, family) {
     return w
   }
 
-  // Medium: [ring][label / reset][rows container] on top, breakdown full width at the bottom.
-  const W = 306, D = 84, TW = 80
+  // Medium: three groups on one left edge: hero row, rows container, breakdown.
+  // ~126pt of height: ring is 52pt here and container rows sit side by side, so all three groups fit.
+  const W = 306, D = 52
   const others = rows.filter(r => r !== hero).concat(state.extra ? [state.extra] : [])
+
+  // (1) Hero row: ring, then label + reset.
   const top = w.addStack()
   top.centerAlignContent()
-  gauge(top, D)
-  top.addSpacer(10)
+  gauge(top, D, 6, 16)
+  top.addSpacer(12)
   const info = top.addStack()
   info.layoutVertically()
-  info.size = new Size(TW, 0)
   text(info, hero.label, Font.systemFont(15), fg)
   const rz = heroReset()
   if (rz) {
     info.addSpacer(2)
-    text(info, rz, Font.systemFont(13), dim).minimumScaleFactor = 0.8
+    text(info, rz, Font.systemFont(13), dim)
   }
+  top.addSpacer()
+
+  // (2) Rows container, full width; one cell per row, side by side.
   if (others.length) {
-    top.addSpacer(12)
-    const cw = W - D - 10 - TW - 12
-    const bw = cw - 24
-    const box = top.addStack()
-    box.layoutVertically()
-    box.size = new Size(cw, 0)
+    w.addSpacer()
+    const gap = 12
+    const cw = (W - 24 - gap * (others.length - 1)) / others.length
+    const box = w.addStack()
+    box.size = new Size(W, 0)
     box.setPadding(12, 12, 12, 12)
     box.cornerRadius = 12
     box.backgroundColor = Color.dynamic(new Color("#000000", 0.05 * a), new Color("#FFFFFF", 0.07 * a))
     others.forEach((r, i) => {
-      if (i) box.addSpacer(8)
+      if (i) box.addSpacer(gap)
       const tone = toneOf(r)
-      const line = box.addStack()
+      const cell = box.addStack()
+      cell.layoutVertically()
+      cell.size = new Size(cw, 0)
+      const line = cell.addStack()
       line.centerAlignContent()
       text(line, r.label, Font.systemFont(13), fg).minimumScaleFactor = 0.8
       line.addSpacer()
@@ -284,20 +289,18 @@ function render(state, family) {
         line.addSpacer(4)
       }
       text(line, `${Math.round(r.pct)}%`, Font.regularMonospacedSystemFont(13), col(tone))
-      box.addSpacer(3)
-      const track = bar(box, bw, 3, col(tone, 0.18))
-      const fill = Math.max(0, Math.min(1, r.pct / 100)) * bw
+      cell.addSpacer(3)
+      const track = bar(cell, cw, 3, col(tone, 0.18))
+      const fill = Math.max(0, Math.min(1, r.pct / 100)) * cw
       if (fill >= 1) bar(track, fill, 3, col(tone))
       track.addSpacer()
     })
-  } else {
-    top.addSpacer()
   }
 
-  // Breakdown: largest first, shades of the accent. Skipped when 3+ rows already fill the height.
+  // (3) Breakdown, same width as the container: largest first, shades of the accent.
   const mix = (state.mix || []).filter(m => m.pct > 0).sort((x, y) => y.pct - x.pct)
   w.addSpacer()
-  if (mix.length && others.length <= 2) {
+  if (mix.length) {
     const total = mix.reduce((s, m) => s + m.pct, 0)
     const room = W - 2 * (mix.length - 1)
     const stack = w.addStack()
@@ -312,7 +315,10 @@ function render(state, family) {
     let legend = items.join(" · ")
     while (items.length > 1 && legend.length * 11 * MONO_W > W) legend = (items.pop(), items.join(" · "))
     w.addSpacer(4)
-    text(w.addStack(), legend, Font.regularMonospacedSystemFont(11), dim)
+    const lg = w.addStack()
+    lg.size = new Size(W, 0)
+    text(lg, legend, Font.regularMonospacedSystemFont(11), dim)
+    lg.addSpacer()
   }
   return w
 }
