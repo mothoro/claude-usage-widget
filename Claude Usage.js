@@ -56,18 +56,19 @@ function label(l) {
 // Rows come from `limits` in API order; fall back to five_hour / seven_day if `limits` is absent or empty.
 function parseRows(u) {
   if (Array.isArray(u.limits) && u.limits.length) {
-    return u.limits.map(l => {
-      const pct = Number(l.percent) || 0
-      return { label: label(l), pct, resets: l.resets_at || null,
-               hot: l.severity === "warning" || pct >= 90 }
-    })
+    return u.limits.map(l => ({ label: label(l), pct: Number(l.percent) || 0, resets: l.resets_at || null,
+                                kind: l.kind || "", active: l.is_active !== false, warn: l.severity === "warning" }))
   }
-  return [["Session", u.five_hour], ["Week", u.seven_day]]
-    .filter(([, b]) => b && b.utilization != null)
-    .map(([lbl, b]) => {
-      const pct = Number(b.utilization) || 0
-      return { label: lbl, pct, resets: b.resets_at || null, hot: pct >= 90 }
-    })
+  return [["Session", "five_hour", u.five_hour], ["Week", "weekly_all", u.seven_day]]
+    .filter(([, , b]) => b && b.utilization != null)
+    .map(([lbl, kind, b]) => ({ label: lbl, pct: Number(b.utilization) || 0, resets: b.resets_at || null,
+                                kind, active: true, warn: false }))
+}
+
+// Extra usage row, only when the plan has it switched on. No reset.
+function parseExtra(u) {
+  const e = u.extra_usage
+  return e && e.is_enabled ? { label: "Extra usage", pct: Number(e.utilization) || 0, resets: null, kind: "extra" } : null
 }
 
 // Per-product share of weekly usage (seven_day_breakdown.rows), API order, zero rows dropped.
@@ -103,7 +104,7 @@ async function load() {
   if (r.status === 200 && r.json) {
     const rows = parseRows(r.json)
     if (rows.length) {
-      const fresh = { rows, mix: parseMix(r.json), ts: Date.now() }
+      const fresh = { rows, mix: parseMix(r.json), extra: parseExtra(r.json), ts: Date.now() }
       fm.writeString(CACHE, JSON.stringify(fresh))
       return fresh
     }
@@ -126,107 +127,192 @@ function fmtReset(iso) {
 const SHORT = { "Claude Code": "Code", "Claude Duet": "Duet" }
 const SHADES = [1, 0.7, 0.45, 0.25, 0.15]
 const MONO_W = 0.6 // monospaced glyph width per point of font size, for legend fitting
+const ACCENT = ["#D97757", "#D97757"] // [light, dark]
+const ORANGE = ["#FF9500", "#FF9F0A"]
+const RED = ["#FF3B30", "#FF453A"]
+// `hot` is the pre-redesign cache flag (warning or >= 90).
+const toneOf = r => (r.pct >= 90 ? RED : r.warn || r.hot ? ORANGE : ACCENT)
+const minute = r => (r && r.resets ? Math.floor(new Date(r.resets) / 60e3) : null)
+
+// Hero: an active session limit if there is one, else the all-models weekly limit.
+function pickHero(rows) {
+  return rows.find(r => /^(session|five_hour)/.test(r.kind || "") && r.active !== false)
+    || rows.find(r => r.kind === "weekly_all") || rows[0]
+}
+
+// Ring gauge image, 7pt stroke with round caps. DrawContext colors are static, so it uses the light tint.
+function ring(pct, d, tone, a) {
+  const ctx = new DrawContext()
+  ctx.size = new Size(d, d)
+  ctx.opaque = false
+  ctx.respectScreenScale = true
+  const sw = 7, r = (d - sw) / 2, c = d / 2
+  ctx.setLineWidth(sw)
+  ctx.setStrokeColor(new Color(tone[0], 0.18 * a))
+  ctx.strokeEllipse(new Rect(sw / 2, sw / 2, d - sw, d - sw))
+  const f = Math.max(0, Math.min(1, pct / 100))
+  if (f > 0) {
+    const at = t => new Point(c + r * Math.cos(2 * Math.PI * t - Math.PI / 2), c + r * Math.sin(2 * Math.PI * t - Math.PI / 2))
+    const n = Math.max(2, Math.ceil(f * 120))
+    const path = new Path()
+    path.move(at(0))
+    for (let i = 1; i <= n; i++) path.addLine(at(f * i / n))
+    ctx.setStrokeColor(new Color(tone[0], a))
+    ctx.addPath(path)
+    ctx.strokePath()
+    ctx.setFillColor(new Color(tone[0], a))
+    for (const p of [at(0), at(f)]) ctx.fillEllipse(new Rect(p.x - sw / 2, p.y - sw / 2, sw, sw))
+  }
+  return ctx.getImage()
+}
 
 function render(state, family) {
   const w = new ListWidget()
   const a = state.stale ? 0.5 : 1
   const dyn = (light, dark, x = 1) => Color.dynamic(new Color(light, a * x), new Color(dark, a * x))
+  const col = (tone, x = 1) => dyn(tone[0], tone[1], x)
   const fg = dyn("#000000", "#FFFFFF")
-  const dim = dyn("#3C3C43", "#EBEBF5", 0.6)
-  const blue = x => dyn("#007AFF", "#0A84FF", x)
-  const red = x => dyn("#FF3B30", "#FF453A", x)
+  const dim = dyn("#000000", "#FFFFFF", 0.55)
   w.backgroundColor = Color.dynamic(new Color("#FFFFFF"), new Color("#1C1C1E"))
   w.refreshAfterDate = new Date(Date.now() + 15 * 60e3)
   w.url = state.dead ? "scriptable:///run/Claude%20Usage" : "https://claude.ai/settings/usage"
   w.setPadding(16, 16, 16, 16)
 
+  const text = (parent, s, font, color) => {
+    const t = parent.addText(s)
+    t.font = font
+    t.textColor = color
+    t.lineLimit = 1
+    return t
+  }
+
   if (state.dead || !state.rows || !state.rows.length) {
     w.addSpacer()
     const s = w.addStack()
     s.addSpacer()
-    const t = s.addText(state.dead ? "Sign in" : "–")
-    t.font = Font.mediumSystemFont(15)
-    t.textColor = fg
+    text(s, state.dead ? "Sign in" : "–", Font.mediumSystemFont(15), fg)
     s.addSpacer()
     w.addSpacer()
     return w
   }
 
   const small = family !== "medium" && family !== "large"
-  const rows = small ? state.rows.slice(0, 2) : state.rows
-  const barW = small ? 126 : 306
-  const minute = r => (r.resets ? Math.floor(new Date(r.resets) / 60e3) : null)
-  const shared = minute(rows[0]) !== null && rows.every(r => minute(r) === minute(rows[0]))
-
-  const bar = (parent, width, tint) => {
+  const rows = state.rows
+  const hero = pickHero(rows)
+  const bar = (parent, width, h, color) => {
     const s = parent.addStack()
-    s.size = new Size(width, 4)
-    s.cornerRadius = 4
-    s.backgroundColor = tint
+    s.size = new Size(width, h)
+    s.cornerRadius = h / 2
+    s.backgroundColor = color
     return s
   }
-  const small10 = (parent, text) => {
-    const t = parent.addText(text)
-    t.font = Font.regularMonospacedSystemFont(10)
-    t.textColor = dim
-    t.lineLimit = 1
-    return t
+  const heroReset = () => {
+    const z = fmtReset(hero.resets)
+    return z === "now" ? "Resets now" : z ? `Resets in ${z}` : ""
+  }
+  // Ring with the percent centered on it.
+  const gauge = (parent, d) => {
+    const g = parent.addStack()
+    g.size = new Size(d, d)
+    g.backgroundImage = ring(hero.pct, d, toneOf(hero), a)
+    g.centerAlignContent()
+    g.addSpacer()
+    const n = g.addStack()
+    n.bottomAlignContent()
+    text(n, `${Math.round(hero.pct)}`, Font.boldMonospacedSystemFont(22), fg)
+    n.addSpacer(1)
+    text(n, "%", Font.systemFont(11), dim)
+    g.addSpacer()
   }
 
-  if (small) w.addSpacer()
-  rows.forEach((r, i) => {
-    if (i) w.addSpacer(10)
-    const tint = r.hot ? red : blue
-    const top = w.addStack()
-    top.centerAlignContent()
-    const l = top.addText(r.label)
-    l.font = Font.systemFont(13)
-    l.textColor = fg
-    l.lineLimit = 1
-    top.addSpacer()
-    const p = top.addText(`${Math.round(r.pct)}%`)
-    p.font = Font.semiboldMonospacedSystemFont(13)
-    p.textColor = fg
-    if (!shared && r.resets) {
-      top.addSpacer(6)
-      small10(top, fmtReset(r.resets))
+  // Small: hero only, centered.
+  if (small) {
+    const centered = fill => {
+      const s = w.addStack()
+      s.addSpacer()
+      fill(s)
+      s.addSpacer()
     }
-    w.addSpacer(4)
-    const track = bar(w, barW, tint(0.15))
-    const fill = Math.max(0, Math.min(1, r.pct / 100)) * barW
-    if (fill >= 1) bar(track, fill, tint(1))
-    track.addSpacer()
-  })
-  if (shared) {
-    w.addSpacer(4)
-    const s = w.addStack()
-    s.addSpacer()
-    const z = fmtReset(rows[0].resets)
-    small10(s, z === "now" ? "Resets now" : `Resets in ${z}`)
+    w.addSpacer()
+    centered(s => gauge(s, 76))
+    w.addSpacer(6)
+    centered(s => text(s, hero.label, Font.systemFont(15), fg))
+    const rz = heroReset()
+    if (rz) {
+      w.addSpacer(1)
+      centered(s => text(s, rz, Font.systemFont(13), dim))
+    }
+    w.addSpacer()
+    return w
   }
 
-  // Medium only: per-product share, largest first, shades of the one tint.
-  const mix = small ? [] : (state.mix || []).filter(m => m.pct > 0).sort((x, y) => y.pct - x.pct)
-  if (mix.length) {
-    w.addSpacer()
-    w.addSpacer(14)
+  // Medium: [ring][label / reset][rows container] on top, breakdown full width at the bottom.
+  const W = 306, D = 84, TW = 80
+  const others = rows.filter(r => r !== hero).concat(state.extra ? [state.extra] : [])
+  const top = w.addStack()
+  top.centerAlignContent()
+  gauge(top, D)
+  top.addSpacer(10)
+  const info = top.addStack()
+  info.layoutVertically()
+  info.size = new Size(TW, 0)
+  text(info, hero.label, Font.systemFont(15), fg)
+  const rz = heroReset()
+  if (rz) {
+    info.addSpacer(2)
+    text(info, rz, Font.systemFont(13), dim).minimumScaleFactor = 0.8
+  }
+  if (others.length) {
+    top.addSpacer(12)
+    const cw = W - D - 10 - TW - 12
+    const bw = cw - 24
+    const box = top.addStack()
+    box.layoutVertically()
+    box.size = new Size(cw, 0)
+    box.setPadding(12, 12, 12, 12)
+    box.cornerRadius = 12
+    box.backgroundColor = Color.dynamic(new Color("#000000", 0.05 * a), new Color("#FFFFFF", 0.07 * a))
+    others.forEach((r, i) => {
+      if (i) box.addSpacer(8)
+      const tone = toneOf(r)
+      const line = box.addStack()
+      line.centerAlignContent()
+      text(line, r.label, Font.systemFont(13), fg).minimumScaleFactor = 0.8
+      line.addSpacer()
+      if (r.resets && minute(r) !== minute(hero)) {
+        text(line, fmtReset(r.resets), Font.regularMonospacedSystemFont(11), dim)
+        line.addSpacer(4)
+      }
+      text(line, `${Math.round(r.pct)}%`, Font.regularMonospacedSystemFont(13), col(tone))
+      box.addSpacer(3)
+      const track = bar(box, bw, 3, col(tone, 0.18))
+      const fill = Math.max(0, Math.min(1, r.pct / 100)) * bw
+      if (fill >= 1) bar(track, fill, 3, col(tone))
+      track.addSpacer()
+    })
+  } else {
+    top.addSpacer()
+  }
+
+  // Breakdown: largest first, shades of the accent. Skipped when 3+ rows already fill the height.
+  const mix = (state.mix || []).filter(m => m.pct > 0).sort((x, y) => y.pct - x.pct)
+  w.addSpacer()
+  if (mix.length && others.length <= 2) {
     const total = mix.reduce((s, m) => s + m.pct, 0)
-    const room = barW - 2 * (mix.length - 1)
+    const room = W - 2 * (mix.length - 1)
     const stack = w.addStack()
-    stack.size = new Size(barW, 4)
+    stack.size = new Size(W, 4)
     mix.forEach((m, i) => {
       if (i) stack.addSpacer(2)
-      bar(stack, Math.max(2, m.pct / total * room), blue(SHADES[Math.min(i, SHADES.length - 1)]))
+      bar(stack, Math.max(2, m.pct / total * room), 4, col(ACCENT, SHADES[Math.min(i, SHADES.length - 1)]))
     })
     stack.addSpacer()
-    // One line, never wraps: drop the smallest items until it fits the bar width.
+    // One line, never wraps: drop the smallest items until it fits.
     const items = mix.map(m => `${SHORT[m.name] || m.name} ${Math.round(m.pct)}`)
     let legend = items.join(" · ")
-    while (items.length > 1 && legend.length * 10 * MONO_W > barW) legend = (items.pop(), items.join(" · "))
+    while (items.length > 1 && legend.length * 11 * MONO_W > W) legend = (items.pop(), items.join(" · "))
     w.addSpacer(4)
-    small10(w.addStack(), legend)
-  } else {
-    w.addSpacer()
+    text(w.addStack(), legend, Font.regularMonospacedSystemFont(11), dim)
   }
   return w
 }
