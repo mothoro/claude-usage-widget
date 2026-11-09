@@ -59,7 +59,7 @@ function parseRows(u) {
     return u.limits.map(l => {
       const pct = Number(l.percent) || 0
       return { label: label(l), pct, resets: l.resets_at || null,
-               hot: (!!l.severity && l.severity !== "normal") || pct >= 90 }
+               hot: l.severity === "warning" || pct >= 90 }
     })
   }
   return [["Session", u.five_hour], ["Week", u.seven_day]]
@@ -113,19 +113,19 @@ async function load() {
 
 // ---- render ----
 
-// "45m", "2h 10m" under a day; otherwise "Thu 9am" / "Thu 9:30am".
+// One unit, rounded down: "3d", "8h", "40m", "now".
 function fmtReset(iso) {
-  if (!iso) return ""
-  const d = new Date(iso)
-  const m = Math.round((d - Date.now()) / 60e3)
+  const m = iso ? Math.floor((new Date(iso) - Date.now()) / 60e3) : NaN
   if (isNaN(m)) return ""
-  if (m <= 0) return "now"
+  if (m < 1) return "now"
   if (m < 60) return `${m}m`
-  if (m < 24 * 60) return `${Math.floor(m / 60)}h ${m % 60}m`
-  const h = d.getHours(), mm = d.getMinutes()
-  const day = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][d.getDay()]
-  return `${day} ${h % 12 || 12}${mm ? ":" + String(mm).padStart(2, "0") : ""}${h < 12 ? "am" : "pm"}`
+  if (m < 24 * 60) return `${Math.floor(m / 60)}h`
+  return `${Math.floor(m / (24 * 60))}d`
 }
+
+const SHORT = { "Claude Code": "Code", "Claude Duet": "Duet" }
+const SHADES = [1, 0.7, 0.45, 0.25, 0.15]
+const MONO_W = 0.6 // monospaced glyph width per point of font size, for legend fitting
 
 function render(state, family) {
   const w = new ListWidget()
@@ -133,12 +133,12 @@ function render(state, family) {
   const dyn = (light, dark, x = 1) => Color.dynamic(new Color(light, a * x), new Color(dark, a * x))
   const fg = dyn("#000000", "#FFFFFF")
   const dim = dyn("#3C3C43", "#EBEBF5", 0.6)
-  const track = dyn("#787880", "#787880", 0.2)
-  const blue = dyn("#007AFF", "#0A84FF")
-  const red = dyn("#FF3B30", "#FF453A")
+  const blue = x => dyn("#007AFF", "#0A84FF", x)
+  const red = x => dyn("#FF3B30", "#FF453A", x)
   w.backgroundColor = Color.dynamic(new Color("#FFFFFF"), new Color("#1C1C1E"))
   w.refreshAfterDate = new Date(Date.now() + 15 * 60e3)
   w.url = state.dead ? "scriptable:///run/Claude%20Usage" : "https://claude.ai/settings/usage"
+  w.setPadding(16, 16, 16, 16)
 
   if (state.dead || !state.rows || !state.rows.length) {
     w.addSpacer()
@@ -154,82 +154,80 @@ function render(state, family) {
 
   const small = family !== "medium" && family !== "large"
   const rows = small ? state.rows.slice(0, 2) : state.rows
-  const mix = small ? [] : state.mix || []
-  const barW = small ? 126 : 300
-  w.setPadding(14, 16, 14, 16)
-  w.addSpacer()
+  const barW = small ? 126 : 306
+  const minute = r => (r.resets ? Math.floor(new Date(r.resets) / 60e3) : null)
+  const shared = minute(rows[0]) !== null && rows.every(r => minute(r) === minute(rows[0]))
+
+  const bar = (parent, width, tint) => {
+    const s = parent.addStack()
+    s.size = new Size(width, 4)
+    s.cornerRadius = 4
+    s.backgroundColor = tint
+    return s
+  }
+  const small10 = (parent, text) => {
+    const t = parent.addText(text)
+    t.font = Font.regularMonospacedSystemFont(10)
+    t.textColor = dim
+    t.lineLimit = 1
+    return t
+  }
+
+  if (small) w.addSpacer()
   rows.forEach((r, i) => {
-    if (i) w.addSpacer(small ? 12 : mix.length ? 5 : 7)
+    if (i) w.addSpacer(10)
+    const tint = r.hot ? red : blue
     const top = w.addStack()
     top.centerAlignContent()
     const l = top.addText(r.label)
-    l.font = Font.semiboldSystemFont(12)
+    l.font = Font.systemFont(13)
     l.textColor = fg
     l.lineLimit = 1
-    top.addSpacer(5)
-    const p = top.addText(`${Math.round(r.pct)}%`)
-    p.font = Font.mediumMonospacedSystemFont(12)
-    p.textColor = fg
     top.addSpacer()
-    const z = top.addText(fmtReset(r.resets))
-    z.font = Font.regularMonospacedSystemFont(10)
-    z.textColor = dim
-    z.lineLimit = 1
-    z.minimumScaleFactor = 0.7
+    const p = top.addText(`${Math.round(r.pct)}%`)
+    p.font = Font.semiboldMonospacedSystemFont(13)
+    p.textColor = fg
+    if (!shared && r.resets) {
+      top.addSpacer(6)
+      small10(top, fmtReset(r.resets))
+    }
     w.addSpacer(4)
-    const bar = w.addStack()
-    bar.size = new Size(barW, 4)
-    bar.cornerRadius = 2
-    bar.backgroundColor = track
+    const track = bar(w, barW, tint(0.15))
     const fill = Math.max(0, Math.min(1, r.pct / 100)) * barW
-    if (fill >= 1) {
-      const f = bar.addStack()
-      f.size = new Size(fill, 4)
-      f.cornerRadius = 2
-      f.backgroundColor = r.hot ? red : blue
-    }
-    bar.addSpacer()
+    if (fill >= 1) bar(track, fill, tint(1))
+    track.addSpacer()
   })
-
-  // Medium only: one stacked bar of per-product share, legend beneath (3 entries per line).
-  if (mix.length) {
-    const tints = [["#007AFF", "#0A84FF"], ["#AF52DE", "#BF5AF2"], ["#FF9500", "#FF9F0A"],
-                   ["#34C759", "#30D158"], ["#5AC8FA", "#64D2FF"], ["#FF2D55", "#FF375F"]]
-    const tint = i => dyn(...tints[i % tints.length])
-    const total = Math.max(100, mix.reduce((s, m) => s + m.pct, 0))
-    w.addSpacer(10)
-    const bar = w.addStack()
-    bar.size = new Size(barW, 6)
-    bar.cornerRadius = 3
-    bar.backgroundColor = track
-    mix.forEach((m, i) => {
-      const seg = bar.addStack()
-      seg.size = new Size(m.pct / total * barW, 6)
-      seg.backgroundColor = tint(i)
-    })
-    bar.addSpacer()
-    for (let i = 0; i < mix.length; i += 3) {
-      w.addSpacer(4)
-      const lg = w.addStack()
-      lg.centerAlignContent()
-      mix.slice(i, i + 3).forEach((m, j) => {
-        if (j) lg.addSpacer(10)
-        const dot = lg.addText("●")
-        dot.font = Font.systemFont(7)
-        dot.textColor = tint(i + j)
-        lg.addSpacer(3)
-        const n = lg.addText(m.name)
-        n.font = Font.systemFont(10)
-        n.textColor = dim
-        n.lineLimit = 1
-        lg.addSpacer(3)
-        const p = lg.addText(`${Math.round(m.pct)}%`)
-        p.font = Font.regularMonospacedSystemFont(10)
-        p.textColor = dim
-      })
-    }
+  if (shared) {
+    w.addSpacer(4)
+    const s = w.addStack()
+    s.addSpacer()
+    const z = fmtReset(rows[0].resets)
+    small10(s, z === "now" ? "Resets now" : `Resets in ${z}`)
   }
-  w.addSpacer()
+
+  // Medium only: per-product share, largest first, shades of the one tint.
+  const mix = small ? [] : (state.mix || []).filter(m => m.pct > 0).sort((x, y) => y.pct - x.pct)
+  if (mix.length) {
+    w.addSpacer()
+    w.addSpacer(14)
+    const total = mix.reduce((s, m) => s + m.pct, 0)
+    const room = barW - 2 * (mix.length - 1)
+    const stack = w.addStack()
+    stack.size = new Size(barW, 4)
+    mix.forEach((m, i) => {
+      if (i) stack.addSpacer(2)
+      bar(stack, Math.max(2, m.pct / total * room), blue(SHADES[Math.min(i, SHADES.length - 1)]))
+    })
+    stack.addSpacer()
+    // One line, never wraps: drop the smallest items until it fits the bar width.
+    const items = mix.map(m => `${SHORT[m.name] || m.name} ${Math.round(m.pct)}`)
+    let legend = items.join(" · ")
+    while (items.length > 1 && legend.length * 10 * MONO_W > barW) legend = (items.pop(), items.join(" · "))
+    w.addSpacer(4)
+    small10(w.addStack(), legend)
+  } else {
+    w.addSpacer()
+  }
   return w
 }
 
