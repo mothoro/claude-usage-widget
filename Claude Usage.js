@@ -126,11 +126,16 @@ function fmtReset(iso) {
 
 const SHORT = { "Claude Code": "Code", "Claude Duet": "Duet" }
 const SHADES = [1, 0.7, 0.45, 0.25, 0.15]
-const MONO_W = 0.6 // monospaced glyph width per point of font size, for legend fitting
 const ACCENT = ["#D97757", "#D97757"] // [light, dark]
 const RED = ["#FF3B30", "#FF453A"]
 const toneOf = r => (r.pct >= 90 ? RED : ACCENT)
 const minute = r => (r && r.resets ? Math.floor(new Date(r.resets) / 60e3) : null)
+// Widget size in points by screen height: [medium width, height]. Small is height x height.
+const SIZES = { 932: [364, 170], 926: [364, 170], 896: [360, 169], 852: [338, 158], 844: [338, 158],
+                812: [329, 155], 780: [329, 155], 736: [348, 157], 667: [321, 148], 568: [292, 141] }
+// Rough width of system-font text, for legend fitting.
+const textW = (s, size) => [...s].reduce((w, c) =>
+  w + (c === " " ? 0.25 : c === "·" ? 0.3 : /[0-9]/.test(c) ? 0.62 : /[A-Z]/.test(c) ? 0.68 : 0.54), 0) * size
 
 // Hero: an active session limit if there is one, else the all-models weekly limit.
 function pickHero(rows) {
@@ -138,15 +143,15 @@ function pickHero(rows) {
     || rows.find(r => r.kind === "weekly_all") || rows[0]
 }
 
-// Ring gauge image with round caps. DrawContext colors are static, so it uses the light tint.
-function ring(pct, d, sw, tone, a) {
+// Ring gauge image with round caps, drawn for the dark tile: white track, `hex` progress.
+function ring(pct, d, sw, hex, a) {
   const ctx = new DrawContext()
   ctx.size = new Size(d, d)
   ctx.opaque = false
   ctx.respectScreenScale = true
   const r = (d - sw) / 2, c = d / 2
   ctx.setLineWidth(sw)
-  ctx.setStrokeColor(new Color(tone[0], 0.18 * a))
+  ctx.setStrokeColor(new Color("#FFFFFF", 0.14 * a))
   ctx.strokeEllipse(new Rect(sw / 2, sw / 2, d - sw, d - sw))
   const f = Math.max(0, Math.min(1, pct / 100))
   if (f > 0) {
@@ -155,26 +160,29 @@ function ring(pct, d, sw, tone, a) {
     const path = new Path()
     path.move(at(0))
     for (let i = 1; i <= n; i++) path.addLine(at(f * i / n))
-    ctx.setStrokeColor(new Color(tone[0], a))
+    ctx.setStrokeColor(new Color(hex, a))
     ctx.addPath(path)
     ctx.strokePath()
-    ctx.setFillColor(new Color(tone[0], a))
+    ctx.setFillColor(new Color(hex, a))
     for (const p of [at(0), at(f)]) ctx.fillEllipse(new Rect(p.x - sw / 2, p.y - sw / 2, sw, sw))
   }
   return ctx.getImage()
 }
 
+// Bento board: a dark hero tile, plus (medium) a column of light tiles for the other limits and the breakdown.
 function render(state, family) {
   const w = new ListWidget()
   const a = state.stale ? 0.5 : 1
   const dyn = (light, dark, x = 1) => Color.dynamic(new Color(light, a * x), new Color(dark, a * x))
-  const col = (tone, x = 1) => dyn(tone[0], tone[1], x)
+  const tint = (tone, x = 1) => dyn(tone[0], tone[1], x)
+  const white = (x = 1) => new Color("#FFFFFF", a * x)
   const fg = dyn("#000000", "#FFFFFF")
-  const dim = dyn("#000000", "#FFFFFF", 0.55)
-  w.backgroundColor = Color.dynamic(new Color("#FFFFFF"), new Color("#1C1C1E"))
+  const dim = dyn("#000000", "#FFFFFF", 0.5)
+  const num = size => (Font.boldRoundedSystemFont ? Font.boldRoundedSystemFont(size) : Font.boldMonospacedSystemFont(size))
+  w.backgroundColor = Color.dynamic(new Color("#EFEFF1"), new Color("#000000"))
   w.refreshAfterDate = new Date(Date.now() + 15 * 60e3)
   w.url = state.dead ? "scriptable:///run/Claude%20Usage" : "https://claude.ai/settings/usage"
-  w.setPadding(16, 16, 16, 16)
+  w.setPadding(10, 10, 10, 10)
 
   const text = (parent, s, font, color) => {
     const t = parent.addText(s)
@@ -183,20 +191,24 @@ function render(state, family) {
     t.lineLimit = 1
     return t
   }
-
-  if (state.dead || !state.rows || !state.rows.length) {
-    w.addSpacer()
-    const s = w.addStack()
+  const centered = (parent, fill) => {
+    const s = parent.addStack()
     s.addSpacer()
-    text(s, state.dead ? "Sign in" : "–", Font.mediumSystemFont(15), fg)
+    fill(s)
     s.addSpacer()
-    w.addSpacer()
-    return w
   }
-
-  const small = family !== "medium" && family !== "large"
-  const rows = state.rows
-  const hero = pickHero(rows)
+  const tile = (parent, dark) => {
+    const t = parent.addStack()
+    t.layoutVertically()
+    t.cornerRadius = 18
+    t.setPadding(12, 12, 12, 12)
+    if (dark) {
+      t.backgroundColor = new Color("#111113", a)
+      t.borderWidth = 1 // shows in dark mode only
+      t.borderColor = Color.dynamic(new Color("#FFFFFF", 0), white(0.1))
+    } else t.backgroundColor = dyn("#FFFFFF", "#1C1C1E")
+    return t
+  }
   const bar = (parent, width, h, color) => {
     const s = parent.addStack()
     s.size = new Size(width, h)
@@ -204,121 +216,128 @@ function render(state, family) {
     s.backgroundColor = color
     return s
   }
-  const heroReset = () => {
+
+  const rows = state.dead ? [] : state.rows || []
+  const hero = pickHero(rows)
+
+  // Dark tile: label + reset on top, ring centered below. Fills its parent unless given a width.
+  const heroTile = (parent, width) => {
+    const t = tile(parent, true)
+    if (width) t.size = new Size(width, 0)
+    if (!hero) {
+      t.addSpacer()
+      centered(t, s => text(s, state.dead ? "Sign in" : "–", Font.mediumSystemFont(15), white()))
+      t.addSpacer()
+      return
+    }
+    const top = t.addStack()
+    top.centerAlignContent()
+    text(top, hero.label, Font.systemFont(12), white(0.55))
+    top.addSpacer()
     const z = fmtReset(hero.resets)
-    return z === "now" ? "Resets now" : z ? `Resets in ${z}` : ""
-  }
-  // Ring with the percent centered on it.
-  const gauge = (parent, d, sw, size) => {
-    const g = parent.addStack()
-    g.size = new Size(d, d)
-    g.backgroundImage = ring(hero.pct, d, sw, toneOf(hero), a)
-    g.centerAlignContent()
-    g.addSpacer()
-    const n = g.addStack()
-    n.bottomAlignContent()
-    text(n, `${Math.round(hero.pct)}`, Font.boldMonospacedSystemFont(size), fg)
-    n.addSpacer(1)
-    text(n, "%", Font.systemFont(Math.round(size / 2)), dim)
-    g.addSpacer()
+    if (z) {
+      const sym = SFSymbol.named("clock")
+      if (sym) {
+        sym.applyFont(Font.systemFont(10))
+        const im = top.addImage(sym.image)
+        im.imageSize = new Size(10, 10)
+        im.tintColor = white(0.55)
+        top.addSpacer(3)
+      }
+      text(top, z, Font.systemFont(12), white(0.55))
+    }
+    t.addSpacer()
+    centered(t, s => {
+      const g = s.addStack()
+      g.size = new Size(82, 82)
+      g.backgroundImage = ring(hero.pct, 82, 8, toneOf(hero)[1], a)
+      g.centerAlignContent()
+      g.addSpacer()
+      const n = g.addStack()
+      n.bottomAlignContent()
+      text(n, `${Math.round(hero.pct)}`, num(24), white())
+      n.addSpacer(1)
+      text(n, "%", Font.systemFont(11), white(0.55))
+      g.addSpacer()
+    })
+    t.addSpacer()
   }
 
-  // Small: hero only, centered.
-  if (small) {
-    const centered = fill => {
-      const s = w.addStack()
-      s.addSpacer()
-      fill(s)
-      s.addSpacer()
-    }
-    w.addSpacer()
-    centered(s => gauge(s, 76, 7, 22))
-    w.addSpacer(6)
-    centered(s => text(s, hero.label, Font.systemFont(15), fg))
-    const rz = heroReset()
-    if (rz) {
-      w.addSpacer(1)
-      centered(s => text(s, rz, Font.systemFont(13), dim))
-    }
-    w.addSpacer()
+  const others = hero ? rows.filter(r => r !== hero).concat(state.extra ? [state.extra] : []) : []
+  const mix = (state.mix || []).filter(m => m.pct > 0).sort((x, y) => y.pct - x.pct)
+  const small = family !== "medium" && family !== "large"
+  if (small || !hero || (!others.length && !mix.length)) {
+    heroTile(w)
     return w
   }
 
-  // Medium: three groups on one left edge: hero row, rows container, breakdown.
-  // ~126pt of height: ring is 52pt here and container rows sit side by side, so all three groups fit.
-  const W = 306, D = 52
-  const others = rows.filter(r => r !== hero).concat(state.extra ? [state.extra] : [])
+  // Medium: square dark tile on the left, light tiles stacked on the right.
+  const scr = Device.screenSize()
+  const [MW, MH] = SIZES[Math.max(scr.width, scr.height)] || [338, 158]
+  const S = MH - 20 // column height = dark tile side
+  const CW = MW - 20 - S - 8 - 24 // content width inside a light tile
+  const n = others.length
+  // What fits in the column: full-size rows with the breakdown, else compact rows, else no breakdown.
+  const MIX_H = 24 + 6 + 6 + 13
+  const fits = ([compact, withMix]) =>
+    !n || 24 + n * (compact ? 24 : 32) + 8 * (n - 1) <= S - (withMix ? MIX_H + 8 : 0)
+  const hasMix = mix.length > 0
+  const [compact, showMix] = [[false, hasMix], [true, hasMix], [false, false], [true, false]].find(fits) || [true, false]
 
-  // (1) Hero row: ring, then label + reset.
-  const top = w.addStack()
-  top.centerAlignContent()
-  gauge(top, D, 6, 16)
-  top.addSpacer(12)
-  const info = top.addStack()
-  info.layoutVertically()
-  text(info, hero.label, Font.systemFont(15), fg)
-  const rz = heroReset()
-  if (rz) {
-    info.addSpacer(2)
-    text(info, rz, Font.systemFont(13), dim)
-  }
-  top.addSpacer()
+  const body = w.addStack()
+  heroTile(body, S)
+  body.addSpacer(8)
+  const right = body.addStack()
+  right.layoutVertically()
 
-  // (2) Rows container, full width; one cell per row, side by side.
-  if (others.length) {
-    w.addSpacer()
-    const gap = 12
-    const cw = (W - 24 - gap * (others.length - 1)) / others.length
-    const box = w.addStack()
-    box.size = new Size(W, 0)
-    box.setPadding(12, 12, 12, 12)
-    box.cornerRadius = 12
-    box.backgroundColor = Color.dynamic(new Color("#000000", 0.05 * a), new Color("#FFFFFF", 0.07 * a))
+  // (a) Limit tile: one row per non-hero limit; takes whatever height the breakdown leaves.
+  if (n) {
+    const lt = tile(right, false)
+    lt.addSpacer()
     others.forEach((r, i) => {
-      if (i) box.addSpacer(gap)
-      const tone = toneOf(r)
-      const cell = box.addStack()
-      cell.layoutVertically()
-      cell.size = new Size(cw, 0)
-      const line = cell.addStack()
+      if (i) lt.addSpacer(8)
+      const line = lt.addStack()
       line.centerAlignContent()
-      text(line, r.label, Font.systemFont(13), fg).minimumScaleFactor = 0.8
-      line.addSpacer()
+      text(line, r.label, Font.systemFont(12), dim)
       if (r.resets && minute(r) !== minute(hero)) {
-        text(line, fmtReset(r.resets), Font.regularMonospacedSystemFont(11), dim)
         line.addSpacer(4)
+        text(line, fmtReset(r.resets), Font.systemFont(11), dim)
       }
-      text(line, `${Math.round(r.pct)}%`, Font.regularMonospacedSystemFont(13), col(tone))
-      cell.addSpacer(3)
-      const track = bar(cell, cw, 3, col(tone, 0.18))
-      const fill = Math.max(0, Math.min(1, r.pct / 100)) * cw
-      if (fill >= 1) bar(track, fill, 3, col(tone))
+      line.addSpacer()
+      text(line, `${Math.round(r.pct)}%`, num(compact ? 15 : 20), fg)
+      lt.addSpacer(compact ? 2 : 4)
+      const track = bar(lt, CW, 4, tint(ACCENT, 0.18))
+      const fill = Math.max(0, Math.min(1, r.pct / 100)) * CW
+      if (fill >= 1) bar(track, fill, 4, tint(toneOf(r)))
       track.addSpacer()
     })
+    lt.addSpacer()
   }
 
-  // (3) Breakdown, same width as the container: largest first, shades of the accent.
-  const mix = (state.mix || []).filter(m => m.pct > 0).sort((x, y) => y.pct - x.pct)
-  w.addSpacer()
-  if (mix.length) {
+  // (b) Breakdown tile: largest first, shades of the accent, one legend line.
+  if (showMix) {
+    if (n) right.addSpacer(8)
+    const bt = tile(right, false)
+    if (!n) bt.addSpacer()
     const total = mix.reduce((s, m) => s + m.pct, 0)
-    const room = W - 2 * (mix.length - 1)
-    const stack = w.addStack()
-    stack.size = new Size(W, 4)
+    const room = CW - 2 * (mix.length - 1)
+    const stack = bt.addStack()
+    stack.size = new Size(CW, 6)
     mix.forEach((m, i) => {
       if (i) stack.addSpacer(2)
-      bar(stack, Math.max(2, m.pct / total * room), 4, col(ACCENT, SHADES[Math.min(i, SHADES.length - 1)]))
+      bar(stack, Math.max(2, m.pct / total * room), 6, tint(ACCENT, SHADES[Math.min(i, SHADES.length - 1)]))
     })
     stack.addSpacer()
-    // One line, never wraps: drop the smallest items until it fits.
+    // One line, never wraps: drop the smallest items until it fits (the text may shrink up to 10%).
     const items = mix.map(m => `${SHORT[m.name] || m.name} ${Math.round(m.pct)}`)
     let legend = items.join(" · ")
-    while (items.length > 1 && legend.length * 11 * MONO_W > W) legend = (items.pop(), items.join(" · "))
-    w.addSpacer(4)
-    const lg = w.addStack()
-    lg.size = new Size(W, 0)
-    text(lg, legend, Font.regularMonospacedSystemFont(11), dim)
+    while (items.length > 1 && textW(legend, 11) > CW / 0.9) legend = (items.pop(), items.join(" · "))
+    bt.addSpacer(6)
+    const lg = bt.addStack()
+    lg.size = new Size(CW, 0)
+    text(lg, legend, Font.systemFont(11), dim).minimumScaleFactor = 0.9
     lg.addSpacer()
+    if (!n) bt.addSpacer()
   }
   return w
 }
